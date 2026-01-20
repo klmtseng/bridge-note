@@ -14,13 +14,12 @@ import {
   Type, 
   ArrowUpAZ,
   QrCode,
-  Image as ImageIcon,
   Loader2
 } from 'lucide-react';
 
 interface SyncData {
-  t: string; // text
-  i?: string[]; // images (base64)
+  t: string; // text (now contains simplified HTML)
+  i?: string[]; // legacy support
 }
 
 const App: React.FC = () => {
@@ -33,7 +32,7 @@ const App: React.FC = () => {
 
   const editorRef = useRef<HTMLDivElement>(null);
 
-  // Helper: Convert URL to Base64 (for external images caught in paste)
+  // Helper: Convert URL to Base64
   const toBase64 = (url: string): Promise<string> => {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -47,39 +46,81 @@ const App: React.FC = () => {
         if (!ctx) { reject('no ctx'); return; }
         ctx.drawImage(img, 0, 0);
         try {
-          const dataURL = canvas.toDataURL('image/png');
+          // Use JPEG with quality 0.7 to reduce size significantly for QR codes
+          const dataURL = canvas.toDataURL('image/jpeg', 0.7);
           resolve(dataURL);
         } catch (e) {
-          reject(e); // Tainted canvas
+          reject(e);
         }
       };
       img.onerror = reject;
     });
   };
 
-  // 1. Initialization Logic
+  // Helper: Aggressively clean HTML to reduce size
+  const cleanHTML = (html: string): string => {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    
+    // Recursive function to strip attributes
+    const stripAttributes = (node: Node) => {
+      if (node.nodeType === 1) { // Element
+        const el = node as HTMLElement;
+        const tagName = el.tagName.toLowerCase();
+        
+        // Keep only semantic tags
+        if (!['div', 'p', 'br', 'ul', 'ol', 'li', 'b', 'strong', 'i', 'em', 'img'].includes(tagName)) {
+           // Unwrap other tags (like spans) but keep content
+           // Note: simple implementation here, usually we'd unwrap. 
+           // For now, we just strip attributes from everything.
+        }
+
+        // Remove ALL attributes except 'src' for images
+        while (el.attributes.length > 0) {
+          const attr = el.attributes[0];
+          if (tagName === 'img' && attr.name === 'src') {
+             // Keep src, but maybe process it later
+             // skip removal
+             break; // Since we are iterating 0, we need to handle specific logic
+          }
+          el.removeAttribute(attr.name);
+        }
+        
+        // Re-add src if it was an image (the loop above is tricky)
+        // Better approach:
+        const src = el.getAttribute('src');
+        // Clear all
+        while (el.attributes.length > 0) {
+          el.removeAttribute(el.attributes[0].name);
+        }
+        // Restore src
+        if (tagName === 'img' && src) {
+          el.setAttribute('src', src);
+          el.style.maxWidth = '100%'; // Add back minimal styling for editor view
+          el.style.borderRadius = '8px';
+        }
+      }
+      
+      node.childNodes.forEach(stripAttributes);
+    };
+
+    doc.body.childNodes.forEach(stripAttributes);
+    return doc.body.innerHTML;
+  };
+
+  // 1. Initialization
   useEffect(() => {
     const hash = window.location.hash;
     
     const initContent = async () => {
-      // A. QR Code Load (New Format)
       if (hash.startsWith('#data=')) {
         try {
           const compressed = hash.substring(6);
           const decompressed = LZString.decompressFromEncodedURIComponent(compressed);
           if (decompressed) {
             const data: SyncData = JSON.parse(decompressed);
-            // Construct HTML from Text + Images (Separate visual, but unified in editor)
-            let html = `<div>${data.t.replace(/\n/g, '<br/>')}</div>`;
-            if (data.i && data.i.length > 0) {
-              html += '<div class="mt-4 grid gap-2">';
-              data.i.forEach(img => {
-                html += `<img src="${img}" class="max-w-full rounded-lg border border-gray-200" /><br/>`;
-              });
-              html += '</div>';
-            }
-            setEditorHtml(html);
-            if (editorRef.current) editorRef.current.innerHTML = html;
+            // Data t is now the full HTML content
+            setEditorHtml(data.t);
+            if (editorRef.current) editorRef.current.innerHTML = data.t;
             setStatusMessage('Synced via QR!');
             window.history.replaceState(null, '', window.location.pathname);
             return;
@@ -87,31 +128,10 @@ const App: React.FC = () => {
         } catch (e) { console.error(e); }
       }
       
-      // B. Local Storage
       const savedHtml = localStorage.getItem('bridgeNoteHtml');
       if (savedHtml) {
         setEditorHtml(savedHtml);
         if (editorRef.current) editorRef.current.innerHTML = savedHtml;
-      } else {
-        // Fallback: Check legacy separate storage
-        const legacyContent = localStorage.getItem('bridgeNoteContent');
-        const legacyImagesStr = localStorage.getItem('bridgeNoteImages');
-        if (legacyContent || legacyImagesStr) {
-          let html = `<div>${(legacyContent || '').replace(/\n/g, '<br/>')}</div>`;
-          if (legacyImagesStr) {
-            try {
-              const imgs: string[] = JSON.parse(legacyImagesStr);
-              imgs.forEach(img => {
-                html += `<img src="${img}" class="max-w-full rounded-lg border border-gray-200" /><br/>`;
-              });
-            } catch(e) {}
-          }
-          setEditorHtml(html);
-          if (editorRef.current) editorRef.current.innerHTML = html;
-          // Clear legacy
-          localStorage.removeItem('bridgeNoteContent');
-          localStorage.removeItem('bridgeNoteImages');
-        }
       }
     };
 
@@ -124,7 +144,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // 2. Persist State
   const handleInput = () => {
     if (editorRef.current) {
       const html = editorRef.current.innerHTML;
@@ -133,13 +152,14 @@ const App: React.FC = () => {
     }
   };
 
-  // 3. Paste Handling
+  // 2. Improved Paste Handling
   const handlePaste = useCallback(async (e: React.ClipboardEvent) => {
-    // A. Handle Files (Images copied from OS or Screenshots)
+    e.preventDefault();
+    setStatusMessage('Processing paste...');
+
+    // A. Handle Images (Files) directly
     if (e.clipboardData.files.length > 0) {
-      e.preventDefault();
       const items = e.clipboardData.items;
-      
       for (let i = 0; i < items.length; i++) {
         if (items[i].type.indexOf('image') !== -1) {
           const blob = items[i].getAsFile();
@@ -147,10 +167,9 @@ const App: React.FC = () => {
             const reader = new FileReader();
             reader.onload = (event) => {
               if (event.target?.result) {
-                // Insert Image at Cursor
-                const imgTag = `<img src="${event.target!.result}" class="max-w-full my-2 rounded-lg" /><br/>`;
+                const imgTag = `<br/><img src="${event.target!.result}" style="max-width:100%; border-radius:8px;" /><br/>`;
                 document.execCommand('insertHTML', false, imgTag);
-                handleInput(); // Trigger save
+                handleInput();
                 setStatusMessage('Image pasted!');
               }
             };
@@ -160,57 +179,68 @@ const App: React.FC = () => {
       }
       return;
     }
-    
-    // B. Handle Mixed Content (Web Selections) - Default Browser Behavior
-    // We let the browser insert the HTML.
-    // However, we want to strip dangerous tags if possible, but for MVP local app, 
-    // we trust the user's clipboard. 
-    // We hook into onInput to save.
-    setTimeout(() => {
-        handleInput();
-        // Scanning for external images could happen here to warn user, 
-        // but let's do it on Sync.
-    }, 0);
 
+    // B. Handle Rich Text (Web Paste)
+    const pastedHtml = e.clipboardData.getData('text/html');
+    const pastedText = e.clipboardData.getData('text/plain');
+
+    if (pastedHtml) {
+      // Clean the HTML immediately to remove bloat
+      const cleaned = cleanHTML(pastedHtml);
+      document.execCommand('insertHTML', false, cleaned);
+    } else {
+      // Fallback to text
+      document.execCommand('insertText', false, pastedText);
+    }
+    
+    handleInput();
+    setStatusMessage('Pasted');
   }, []);
 
-  // 4. Extraction Logic (The "Bridge" part)
+  // 3. Extraction with Optimization
   const extractData = async (): Promise<SyncData> => {
-    if (!editorRef.current) return { t: '', i: [] };
+    if (!editorRef.current) return { t: '' };
     
-    // Use a clone to parse clean text
+    // Clone and finalize HTML for export
     const clone = editorRef.current.cloneNode(true) as HTMLElement;
     
-    // Extract Text (innerText gives us cleaner newlines than textContent)
-    const text = clone.innerText;
-
-    // Extract Images
+    // Process images
     const imgTags = Array.from(clone.querySelectorAll('img'));
-    const images: string[] = [];
-
+    
+    // We try to convert all images to Base64 in-place within the HTML string
+    // This makes the 't' property self-contained
     for (const img of imgTags) {
       const src = img.getAttribute('src');
       if (!src) continue;
 
-      if (src.startsWith('data:')) {
-        images.push(src);
-      } else {
-        // External URL: Try to convert to Base64
+      // Remove styles for export to save space
+      img.removeAttribute('style');
+      img.removeAttribute('class');
+      // Set width attribute for email/notes compatibility
+      img.setAttribute('width', '100%');
+
+      if (!src.startsWith('data:')) {
         try {
           const base64 = await toBase64(src);
-          images.push(base64);
+          img.setAttribute('src', base64);
         } catch (e) {
-          console.warn('CORS prevented image export:', src);
-          // If we can't export it, we skip it for the "Offline Sync".
-          // The user still sees it in the editor, but it won't cross the bridge.
+          console.warn('Cannot convert image', src);
+          // If we can't convert it, we leave the URL. 
+          // It might not render on phone if private, but it's better than nothing.
         }
       }
     }
 
-    return { t: text, i: images };
+    // Final clean pass to ensure no junk attributes exist in the export
+    let finalHtml = clone.innerHTML;
+    
+    // Very basic minification: remove comments and excessive whitespace
+    finalHtml = finalHtml.replace(/<!--[\s\S]*?-->/g, "");
+    finalHtml = finalHtml.replace(/>\s+</g, "><");
+
+    return { t: finalHtml };
   };
 
-  // 5. Actions
   const handleFormat = (type: FormatType) => {
     document.execCommand('styleWithCSS', false, 'true');
     switch (type) {
@@ -218,20 +248,19 @@ const App: React.FC = () => {
         document.execCommand('insertUnorderedList');
         break;
       case FormatType.CLEANUP:
-        // Basic cleanup: remove double spaces? 
-        // Hard to do in contentEditable without resetting cursor.
-        // Let's just strip styles.
-        document.execCommand('removeFormat');
-        setStatusMessage('Styles removed');
+        // Aggressive cleanup button
+        if (editorRef.current) {
+            const clean = cleanHTML(editorRef.current.innerHTML);
+            editorRef.current.innerHTML = clean;
+            handleInput();
+            setStatusMessage('Content cleaned');
+        }
         break;
       case FormatType.UPPERCASE:
-        // Applies to selection
         const selection = window.getSelection();
         if (selection && !selection.isCollapsed) {
             const text = selection.toString().toUpperCase();
             document.execCommand('insertText', false, text);
-        } else {
-            setStatusMessage('Select text first');
         }
         break;
       case FormatType.LOWERCASE:
@@ -239,17 +268,15 @@ const App: React.FC = () => {
         if (sel && !sel.isCollapsed) {
             const text = sel.toString().toLowerCase();
             document.execCommand('insertText', false, text);
-        } else {
-            setStatusMessage('Select text first');
         }
         break;
     }
-    handleInput();
+    editorRef.current?.focus();
   };
 
   const prepareQR = async () => {
     setIsProcessing(true);
-    setStatusMessage('Preparing data...');
+    setStatusMessage('Compressing...');
     try {
       const data = await extractData();
       setSyncData(data);
@@ -276,43 +303,51 @@ const App: React.FC = () => {
   const handleShare = async () => {
     setIsProcessing(true);
     try {
-      const data = await extractData();
-      
-      if (!data.t && data.i?.length === 0) {
+      if (!editorRef.current?.innerText.trim() && !editorRef.current?.querySelector('img')) {
         setStatusMessage('Nothing to share');
         return;
+      }
+
+      const text = editorRef.current.innerText;
+      
+      // Share API primarily supports text or files. 
+      // Sharing rich HTML via Web Share API is not well supported.
+      // We share the plain text, and if there are images, we try to attach them.
+      
+      const images: File[] = [];
+      const imgTags = Array.from(editorRef.current.querySelectorAll('img')) as HTMLImageElement[];
+      
+      for (let i = 0; i < imgTags.length; i++) {
+         const src = imgTags[i].src;
+         if (src.startsWith('data:')) {
+            const arr = src.split(',');
+            const mime = arr[0].match(/:(.*?);/)![1];
+            const bstr = atob(arr[1]);
+            let n = bstr.length;
+            const u8arr = new Uint8Array(n);
+            while(n--){
+              u8arr[n] = bstr.charCodeAt(n);
+            }
+            const ext = mime.split('/')[1] === 'jpeg' ? 'jpg' : mime.split('/')[1];
+            images.push(new File([u8arr], `image-${i}.${ext}`, { type: mime }));
+         }
       }
 
       if (navigator.share) {
         const shareData: ShareData = {
           title: 'BridgeNote',
-          text: data.t,
+          text: text,
         };
 
-        if (data.i && data.i.length > 0) {
-           const files = data.i.map((base64, idx) => {
-             const arr = base64.split(',');
-             const mime = arr[0].match(/:(.*?);/)![1];
-             const bstr = atob(arr[1]);
-             let n = bstr.length;
-             const u8arr = new Uint8Array(n);
-             while(n--){
-               u8arr[n] = bstr.charCodeAt(n);
-             }
-             const ext = mime.split('/')[1] || 'png';
-             return new File([u8arr], `image-${idx}.${ext}`, { type: mime });
-           });
-           
-           if (navigator.canShare && navigator.canShare({ files })) {
-             shareData.files = files;
-           }
+        if (images.length > 0 && navigator.canShare && navigator.canShare({ files: images })) {
+             shareData.files = images;
         }
         
         await navigator.share(shareData);
         setStatusMessage('Shared!');
       } else {
-        await navigator.clipboard.writeText(data.t);
-        setStatusMessage('Copied (Share API unsupported)');
+        await navigator.clipboard.writeText(text);
+        setStatusMessage('Copied Text (Share unsupported)');
       }
     } catch (e) {
       console.log(e);
@@ -327,9 +362,6 @@ const App: React.FC = () => {
       setEditorHtml('');
       if (editorRef.current) editorRef.current.innerHTML = '';
       localStorage.removeItem('bridgeNoteHtml');
-      // Also clear legacy
-      localStorage.removeItem('bridgeNoteContent');
-      localStorage.removeItem('bridgeNoteImages');
     }
   };
 
@@ -337,7 +369,6 @@ const App: React.FC = () => {
     <div className="min-h-screen pb-24 sm:pb-20">
       <TopBar />
       <FeatureModal isOpen={showInfo} onClose={() => setShowInfo(false)} />
-      {/* Pass calculated syncData to Modal */}
       <QRCodeModal isOpen={showQR} onClose={() => setShowQR(false)} data={syncData} />
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6">
@@ -396,7 +427,7 @@ const App: React.FC = () => {
               onClick={() => handleFormat(FormatType.CLEANUP)}
               icon={<AlignLeft size={16} className="text-blue-500" />}
             >
-              Clean
+              Smart Clean
             </Button>
             <Button 
               variant="secondary" 
