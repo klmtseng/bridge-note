@@ -1,0 +1,5 @@
+{
+  "name": "BridgeNote",
+  "description": "A private, offline clipboard tool to format web clippings and bridge them to your iPhone Notes via the Web Share API.",
+  "requestFramePermissions": []
+}
