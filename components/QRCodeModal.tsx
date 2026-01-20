@@ -17,32 +17,29 @@ interface QRCodeModalProps {
 export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, data }) => {
   if (!isOpen) return null;
 
-  const { syncUrl, isTooLong, hasImagesError } = useMemo(() => {
+  const { syncUrl, isTooLong, errorMsg } = useMemo(() => {
     const baseUrl = window.location.href.split('#')[0];
     
-    // 1. Try to compress everything (Text + Images)
-    const compressedFull = LZString.compressToEncodedURIComponent(JSON.stringify(data));
-    const fullUrl = `${baseUrl}#data=${compressedFull}`;
+    // 1. Compress
+    const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(data));
+    const url = `${baseUrl}#data=${compressed}`;
 
-    // Practical QR limit
-    if (fullUrl.length < 2200) {
-      return { syncUrl: fullUrl, isTooLong: false, hasImagesError: false };
+    // 2. Check length (Approx 2300 is a safe upper bound for Version 40 QR + reader capability)
+    if (url.length < 2300) {
+      return { syncUrl: url, isTooLong: false, errorMsg: '' };
     }
 
-    // 2. If too long and we have images, try compressing ONLY text
-    if (data.i && data.i.length > 0) {
-      const textData = { t: data.t }; 
-      const compressedText = LZString.compressToEncodedURIComponent(JSON.stringify(textData));
-      const textUrl = `${baseUrl}#data=${compressedText}`;
-      
-      if (textUrl.length < 2200) {
-        return { syncUrl: textUrl, isTooLong: false, hasImagesError: true };
-      }
-    }
-
-    return { syncUrl: '', isTooLong: true, hasImagesError: false };
+    // 3. Fallback: If too long, try stripping images from the HTML string?
+    // This logic is complex because images are now embedded in `t`.
+    // For now, we return error.
+    return { 
+      syncUrl: '', 
+      isTooLong: true, 
+      errorMsg: 'Content is still too large even after compression. Please delete some images or text.' 
+    };
     
   }, [data]);
+
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -62,32 +59,20 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({ isOpen, onClose, data 
         {isTooLong ? (
           <div className="h-64 flex flex-col items-center justify-center text-center text-red-500 px-4 space-y-2">
             <AlertTriangle size={32} />
-            <p className="font-medium">Content Too Large</p>
+            <p className="font-medium">Limit Exceeded</p>
             <p className="text-xs text-gray-500">
-              The QR code capacity is exceeded. <br/>
-              Please shorten text or remove images to sync.
+              {errorMsg}
             </p>
           </div>
         ) : (
-          <>
-            <div className="bg-white p-2 rounded-lg shadow-inner border border-gray-100">
-              <QRCode 
-                value={syncUrl} 
-                size={200}
-                style={{ height: "auto", maxWidth: "100%", width: "100%" }}
-                viewBox={`0 0 256 256`}
-              />
-            </div>
-            
-            {hasImagesError && (
-              <div className="mt-4 flex items-start gap-2 text-xs text-orange-600 bg-orange-50 p-2 rounded-lg">
-                <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
-                <span>
-                  <strong>Images skipped.</strong> Images are too large for the QR code, but text will sync.
-                </span>
-              </div>
-            )}
-          </>
+          <div className="bg-white p-2 rounded-lg shadow-inner border border-gray-100">
+            <QRCode 
+              value={syncUrl} 
+              size={200}
+              style={{ height: "auto", maxWidth: "100%", width: "100%" }}
+              viewBox={`0 0 256 256`}
+            />
+          </div>
         )}
 
         <p className="text-center text-sm text-gray-500 mt-6 leading-relaxed">
